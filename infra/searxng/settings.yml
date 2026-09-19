@@ -1,0 +1,14 @@
+use_default_settings: true
+
+server:
+  bind_address: 0.0.0.0
+  secret_key: change-this-local-secret-key
+
+search:
+  safe_search: 0
+  formats:
+    - html
+    - json
+
+redis:
+  url: redis://redis:6379/0

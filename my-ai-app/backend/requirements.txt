@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+google-genai
+httpx
+mysql-connector-python
+pillow
+pytesseract
+numpy
+python-multipart
+pypdf

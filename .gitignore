@@ -1,0 +1,39 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.local
+*.pem
+*.key
+*.p12
+
+# Dependencies, builds, and Python caches
+node_modules/
+dist/
+dist-ssr/
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local data and generated output
+.runtime-cache/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.mp3
+*.wav
+.DS_Store
+.vscode/
+.idea/
+
+# This Live2D model's accompanying terms prohibit redistribution.
+/my-ai-app/public/live2d/huohuo/
+
+# Generated evaluation transcripts and verification results
+/my-ai-app/backend/evaluations/eval-*.json
+/my-ai-app/backend/evaluations/conversation-review.json
+/my-ai-app/backend/evaluations/dialogue-improvement-review.json
+/my-ai-app/backend/evaluations/intent-verification.json
+/my-ai-app/backend/evaluations/search-verification.json
