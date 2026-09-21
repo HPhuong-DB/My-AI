@@ -279,14 +279,26 @@ def execute_registered_tool(
 
             return {"ok": True, "knowledge": list_knowledge(user_id, args.get("limit", 20))}
         if tool_name == "save_experience":
-            from services.knowledge_service import save_experience
+            from services.memory_orchestrator import memory_orchestrator
 
-            experience = save_experience(user_id, args.get("title", ""), args.get("lesson", ""), args.get("context", ""))
+            experience = memory_orchestrator.remember_experience(
+                user_id,
+                args.get("title", ""),
+                args.get("lesson", ""),
+                args.get("context", ""),
+            )
             return {"ok": experience is not None, "experience": experience}
         if tool_name == "get_long_term_memory":
-            from services.knowledge_service import get_long_term_memory
+            from services.memory_orchestrator import memory_orchestrator
 
-            return {"ok": True, "memory": get_long_term_memory(user_id, args.get("query", ""), args.get("limit", 10))}
+            return {
+                "ok": True,
+                "memory": memory_orchestrator.recall_long_term(
+                    user_id,
+                    args.get("query", ""),
+                    args.get("limit", 10),
+                ),
+            }
         if tool_name == "evaluate_progress":
             from services.progress_service import evaluate_progress
 
@@ -352,44 +364,9 @@ def execute_registered_tool(
 def _ensure_tool_tables(conn):
     if not conn:
         return
+    from core.migrations import ensure_schema
 
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS personal_tasks (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                user_id VARCHAR(100) NOT NULL DEFAULT 'default',
-                title VARCHAR(255) NOT NULL,
-                description TEXT,
-                done TINYINT(1) DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS personal_reminders (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                user_id VARCHAR(100) NOT NULL DEFAULT 'default',
-                title VARCHAR(255) NOT NULL,
-                scheduled_for DATETIME NOT NULL,
-                note TEXT,
-                done TINYINT(1) DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        cursor.execute("SHOW COLUMNS FROM personal_tasks LIKE 'status'")
-        if cursor.fetchone() is None:
-            cursor.execute("ALTER TABLE personal_tasks ADD COLUMN status VARCHAR(30) DEFAULT 'todo'")
-        cursor.execute("SHOW COLUMNS FROM personal_tasks LIKE 'progress'")
-        if cursor.fetchone() is None:
-            cursor.execute("ALTER TABLE personal_tasks ADD COLUMN progress INT DEFAULT 0")
-        cursor.execute("UPDATE personal_tasks SET status = 'done', progress = 100 WHERE done = 1")
-        conn.commit()
-    finally:
-        cursor.close()
+    ensure_schema(conn)
 
 
 def create_task(user_id=DEFAULT_USER_ID, title="", description=""):

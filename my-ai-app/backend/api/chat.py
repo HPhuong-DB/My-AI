@@ -20,7 +20,6 @@ from agent.events import Event, EventType
 from agent.perception import PerceptionContentType, PerceptionInput, PerceptionSource, create_perception_event
 from agent.runtime import event_bus, output_bus, privacy_manager
 from schemas.message import ChatRequest, ChatResponse
-from services.chat_service import save_chat_message, get_recent_chat_history
 from services.session_service import user_lock
 from core.database import DatabaseUnavailable
 from services.llm_service import (
@@ -32,7 +31,7 @@ from services.llm_service import (
     resolve_response_mode,
     stream_huohuo_response,
 )
-from services.memory_service import save_memory_from_conversation
+from services.memory_orchestrator import memory_orchestrator
 from services.personality_service import personality_engine
 from services.proactive_service import observe_message
 from services.tool_service import execute_tool_call, trigger_due_reminder_notification
@@ -101,7 +100,12 @@ async def _realtime_context(user_text: str, *, search_query: str | None = None, 
 async def _intent_context(text: str, user_id: str) -> str:
     history = []
     if rule_intent(text) is None and is_followup(text):
-        history = await asyncio.to_thread(get_recent_chat_history, limit=11, user_id=user_id, strict=True)
+        history = await asyncio.to_thread(
+            memory_orchestrator.recall_history,
+            user_id,
+            limit=11,
+            strict=True,
+        )
         # _prepare_chat has persisted this turn; it must not resolve its own reference.
         if history and history[-1]['role'] == 'user' and history[-1]['content'] == text:
             history = history[:-1]
@@ -147,8 +151,11 @@ async def _prepare_chat(request: ChatRequest) -> asyncio.Task[Any]:
     )
 
     # Commit new/corrected facts before building the next prompt.
-    await asyncio.to_thread(save_memory_from_conversation, request.text, "", request.user_id, strict=True)
-    await asyncio.to_thread(save_chat_message, "user", request.text, request.user_id, strict=True)
+    await asyncio.to_thread(
+        memory_orchestrator.prepare_user_turn,
+        request.user_id,
+        request.text,
+    )
     # Reminder lookup runs in parallel with the LLM and is bounded when read at the end.
     return asyncio.create_task(asyncio.to_thread(trigger_due_reminder_notification, request.user_id))
 
@@ -251,7 +258,12 @@ def _response_payload(
 
 
 async def _persist_response(request: ChatRequest, reply_vi: str) -> None:
-    await asyncio.to_thread(save_chat_message, "assistant", reply_vi, request.user_id, strict=True)
+    await asyncio.to_thread(
+        memory_orchestrator.record_assistant_message,
+        request.user_id,
+        reply_vi,
+        user_message=request.text,
+    )
 
 
 async def _publish_response(request: ChatRequest, payload: dict[str, Any]) -> None:
@@ -283,7 +295,14 @@ def _require_valid_result(result: LLMResult, *, allow_tools=False) -> None:
 
 @router.get("/chat/history")
 def chat_history(user_id: str = Query("default", min_length=1, max_length=100), limit: int = Query(50, ge=1, le=100)):
-    return {"messages": get_recent_chat_history(limit, user_id, for_context=False, strict=True)}
+    return {
+        "messages": memory_orchestrator.recall_history(
+            user_id,
+            limit=limit,
+            for_context=False,
+            strict=True,
+        )
+    }
 
 
 @router.post("/chat", response_model=ChatResponse)

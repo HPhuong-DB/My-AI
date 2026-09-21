@@ -14,6 +14,7 @@ import httpx
 
 from core.database import get_db_connection
 from services.llm_service import summarize_research_sources
+from services.memory_metadata import clamp_score, expiry_from_env, normalize_expiry
 from services.web_search_service import search_web
 
 DEFAULT_USER_ID = os.getenv("DEFAULT_USER_ID", "default")
@@ -79,30 +80,30 @@ async def _read_source(item: dict[str, Any]) -> dict[str, Any]:
 def _ensure_knowledge_table(conn):
     if not conn:
         return
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS personal_knowledge (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                user_id VARCHAR(100) NOT NULL DEFAULT 'default',
-                query_text VARCHAR(500) NOT NULL,
-                title VARCHAR(255) NOT NULL,
-                summary TEXT NOT NULL,
-                key_points TEXT,
-                sources TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                INDEX idx_knowledge_user (user_id)
-            )
-            """
-        )
-        conn.commit()
-    finally:
-        cursor.close()
+    from core.migrations import ensure_schema
+
+    ensure_schema(conn)
 
 
-def save_knowledge(user_id: str, query: str, title: str, summary: str, key_points: list[str], sources: list[dict[str, Any]]) -> dict[str, Any] | None:
+def save_knowledge(
+    user_id: str,
+    query: str,
+    title: str,
+    summary: str,
+    key_points: list[str],
+    sources: list[dict[str, Any]],
+    *,
+    confidence: float = 0.75,
+    importance: float = 0.60,
+    source_type: str = "research",
+    source_ref: str | None = None,
+    expires_at: Any = None,
+) -> dict[str, Any] | None:
+    confidence = clamp_score(confidence, 0.75)
+    importance = clamp_score(importance, 0.60)
+    source_type = str(source_type or "research")[:50]
+    source_ref = str(source_ref or query)[:255] or None
+    expires_at = normalize_expiry(expires_at) if expires_at is not None else expiry_from_env("KNOWLEDGE_TTL_DAYS", 30)
     conn = get_db_connection()
     if not conn:
         return None
@@ -111,12 +112,23 @@ def save_knowledge(user_id: str, query: str, title: str, summary: str, key_point
         _ensure_knowledge_table(conn)
         cursor = conn.cursor(dictionary=True)
         cursor.execute(
-            "INSERT INTO personal_knowledge (user_id, query_text, title, summary, key_points, sources) VALUES (%s, %s, %s, %s, %s, %s)",
-            (user_id, query[:500], title[:255], summary, json.dumps(key_points, ensure_ascii=False), json.dumps(sources, ensure_ascii=False)),
+            "INSERT INTO personal_knowledge "
+            "(user_id, query_text, title, summary, key_points, sources, confidence, importance, source_type, source_ref, expires_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                user_id, query[:500], title[:255], summary,
+                json.dumps(key_points, ensure_ascii=False), json.dumps(sources, ensure_ascii=False),
+                confidence, importance, source_type, source_ref, expires_at,
+            ),
         )
         knowledge_id = cursor.lastrowid
         conn.commit()
-        return {"id": knowledge_id, "user_id": user_id, "query": query, "title": title, "summary": summary, "key_points": key_points, "sources": sources}
+        return {
+            "id": knowledge_id, "user_id": user_id, "query": query, "title": title,
+            "summary": summary, "key_points": key_points, "sources": sources,
+            "confidence": confidence, "importance": importance, "source_type": source_type,
+            "source_ref": source_ref, "expires_at": expires_at,
+        }
     except Exception as exc:
         print(f"Lỗi lưu knowledge: {exc}")
         return None
@@ -135,7 +147,14 @@ def list_knowledge(user_id: str = DEFAULT_USER_ID, limit: int = 20) -> list[dict
     try:
         _ensure_knowledge_table(conn)
         cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT id, user_id, query_text, title, summary, key_points, sources, created_at, updated_at FROM personal_knowledge WHERE user_id = %s ORDER BY updated_at DESC LIMIT %s", (user_id, max(1, min(int(limit), 50))))
+        cursor.execute(
+            "SELECT id, user_id, query_text, title, summary, key_points, sources, confidence, importance, "
+            "source_type, source_ref, expires_at, created_at, updated_at FROM personal_knowledge "
+            "WHERE user_id = %s AND forgotten_at IS NULL "
+            "AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP) "
+            "ORDER BY updated_at DESC LIMIT %s",
+            (user_id, max(1, min(int(limit), 50))),
+        )
         rows = []
         for row in cursor.fetchall() or []:
             item = dict(row)
@@ -168,6 +187,20 @@ async def run_research(query: str, user_id: str = DEFAULT_USER_ID, max_sources: 
     summary = await summarize_research_sources(query, usable)
     response = {"ok": True, "query": query, "summary": summary, "sources": [{key: item.get(key, "") for key in ("title", "url", "snippet", "ok")} for item in usable]}
     if save:
-        saved = await asyncio.to_thread(save_knowledge, user_id, query, summary.get("title", query), summary.get("summary", ""), summary.get("key_points", []), response["sources"])
+        from services.memory_orchestrator import memory_orchestrator
+
+        saved = await asyncio.to_thread(
+            memory_orchestrator.remember_knowledge,
+            user_id,
+            query,
+            summary.get("title", query),
+            summary.get("summary", ""),
+            summary.get("key_points", []),
+            response["sources"],
+            confidence=min(0.95, 0.65 + 0.08 * len(usable)),
+            importance=0.65,
+            source_type="research",
+            source_ref=query,
+        )
         response["knowledge"] = saved
     return response

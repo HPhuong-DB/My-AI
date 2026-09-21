@@ -23,7 +23,7 @@ class IntentTests(unittest.IsolatedAsyncioTestCase):
             model.assert_not_awaited()
 
     async def test_ordinary_chat_skips_second_model_and_history_lookup(self):
-        with patch.object(intent, 'model_intent', AsyncMock()) as model, patch.object(chat, 'get_recent_chat_history') as history:
+        with patch.object(intent, 'model_intent', AsyncMock()) as model, patch.object(chat.memory_orchestrator, 'recall_history') as history:
             self.assertEqual(await chat._intent_context('Bạn kể gì vui đi', 'alice'), 'Bạn kể gì vui đi')
             self.assertEqual(await chat._intent_context('Ừm, thú vị đấy', 'alice'), 'Ừm, thú vị đấy')
             model.assert_not_awaited()
@@ -64,9 +64,9 @@ class IntentTests(unittest.IsolatedAsyncioTestCase):
     async def test_chat_reads_scoped_history_and_removes_current_duplicate(self):
         text = 'Còn mùa hiện tại thì sao?'
         history = [{'role': 'user', 'content': 'TFT là gì?'}, {'role': 'user', 'content': text}]
-        with patch.object(chat, 'get_recent_chat_history', return_value=history) as read, patch.object(intent, 'model_intent', AsyncMock(return_value=None)), patch.object(chat, '_realtime_context', AsyncMock(return_value='grounded')) as search:
+        with patch.object(chat.memory_orchestrator, 'recall_history', return_value=history) as read, patch.object(intent, 'model_intent', AsyncMock(return_value=None)), patch.object(chat, '_realtime_context', AsyncMock(return_value='grounded')) as search:
             self.assertEqual(await chat._intent_context(text, 'alice'), 'grounded')
-        read.assert_called_once_with(limit=11, user_id='alice', strict=True)
+        read.assert_called_once_with('alice', limit=11, strict=True)
         self.assertIn('TFT', search.call_args.kwargs['search_query'])
 
     async def test_followup_can_reference_topic_five_exchanges_earlier(self):
@@ -110,7 +110,7 @@ class IntentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(payload['options']['temperature'], 0)
 
     async def test_greeting_variants_skip_classifier_and_history(self):
-        with patch.object(intent, 'model_intent', AsyncMock()) as model, patch.object(chat, 'get_recent_chat_history') as history:
+        with patch.object(intent, 'model_intent', AsyncMock()) as model, patch.object(chat.memory_orchestrator, 'recall_history') as history:
             for text in ('hi', 'Hello!', 'Chào Huohuo', 'Xin chào bạn nhé 👋', 'chào cậu', 'hey'):
                 self.assertEqual(await chat._intent_context(text, 'alice'), text)
             model.assert_not_awaited()

@@ -9,26 +9,9 @@ DEFAULT_USER_ID = os.getenv("DEFAULT_USER_ID", "default")
 def _ensure_table_exists(conn):
     if not conn:
         return
+    from core.migrations import ensure_schema
 
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS chat_history (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                user_id VARCHAR(100) NOT NULL DEFAULT 'default',
-                role VARCHAR(50) NOT NULL,
-                content TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        cursor.execute("SHOW COLUMNS FROM chat_history LIKE 'user_id'")
-        if cursor.fetchone() is None:
-            cursor.execute("ALTER TABLE chat_history ADD COLUMN user_id VARCHAR(100) NOT NULL DEFAULT 'default'")
-        conn.commit()
-    finally:
-        cursor.close()
+    ensure_schema(conn)
 
 
 # --- LƯU TIN NHẮN MỚI VÀO DATABASE ---
@@ -44,8 +27,9 @@ def save_chat_message(role, content, user_id=DEFAULT_USER_ID, *, strict=False):
             cursor = conn.cursor()
             sql = "INSERT INTO chat_history (user_id, role, content) VALUES (%s, %s, %s)"
             cursor.execute(sql, (user_id, str(role), str(content)))
+            message_id = getattr(cursor, "lastrowid", None)
             conn.commit()
-            return True
+            return message_id or True
         except Exception as e:
             if strict:
                 raise DatabaseUnavailable("Không thể lưu lịch sử") from e
@@ -72,8 +56,11 @@ def get_recent_chat_history(limit=15, user_id=DEFAULT_USER_ID, *, for_context=Tr
             cursor = conn.cursor(dictionary=True)
             condition = ""
             if for_context:
-                cursor.execute("CREATE TABLE IF NOT EXISTS memory_context_state (user_id VARCHAR(100) PRIMARY KEY, cutoff_chat_id INT NOT NULL DEFAULT 0)")
-                condition = " AND id > COALESCE((SELECT cutoff_chat_id FROM memory_context_state WHERE user_id = %s), 0)"
+                condition = (
+                    " AND id > COALESCE((SELECT cutoff_chat_id FROM memory_context_state WHERE user_id = %s), 0)"
+                    " AND NOT EXISTS (SELECT 1 FROM memory_context_exclusions excluded "
+                    "WHERE excluded.user_id = chat_history.user_id AND excluded.chat_id = chat_history.id)"
+                )
             sql = "SELECT role, content FROM chat_history WHERE user_id = %s" + condition + " ORDER BY id DESC LIMIT %s"
             cursor.execute(sql, (user_id, user_id, limit) if for_context else (user_id, limit))
             rows = cursor.fetchall()

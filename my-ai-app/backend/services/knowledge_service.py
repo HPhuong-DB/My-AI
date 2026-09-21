@@ -7,6 +7,7 @@ import os
 from typing import Any
 
 from core.database import get_db_connection
+from services.memory_metadata import clamp_score, expiry_from_env, normalize_expiry
 from services.memory_service import get_recent_memories
 from services.research_service import list_knowledge
 
@@ -16,33 +17,33 @@ DEFAULT_USER_ID = os.getenv("DEFAULT_USER_ID", "default")
 def _ensure_experience_table(conn) -> None:
     if not conn:
         return
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS agent_experiences (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                user_id VARCHAR(100) NOT NULL DEFAULT 'default',
-                title VARCHAR(255) NOT NULL,
-                lesson TEXT NOT NULL,
-                context TEXT,
-                source_type VARCHAR(50) DEFAULT 'goal',
-                source_id INT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                INDEX idx_experiences_user (user_id)
-            )
-            """
-        )
-        conn.commit()
-    finally:
-        cursor.close()
+    from core.migrations import ensure_schema
+
+    ensure_schema(conn)
 
 
-def save_experience(user_id: str = DEFAULT_USER_ID, title: str = "", lesson: str = "", context: str = "", source_type: str = "goal", source_id: int | None = None) -> dict[str, Any] | None:
+def save_experience(
+    user_id: str = DEFAULT_USER_ID,
+    title: str = "",
+    lesson: str = "",
+    context: str = "",
+    source_type: str = "goal",
+    source_id: int | None = None,
+    *,
+    source_ref: str | None = None,
+    confidence: float = 0.80,
+    importance: float = 0.75,
+    expires_at: Any = None,
+) -> dict[str, Any] | None:
     title = str(title or "").strip()
     lesson = str(lesson or "").strip()
     if not title or not lesson:
         raise ValueError("Experience cần title và lesson")
+    source_type = str(source_type or "goal")[:50]
+    confidence = clamp_score(confidence, 0.80)
+    importance = clamp_score(importance, 0.75)
+    source_ref = str(source_ref)[:255] if source_ref not in (None, "") else (str(source_id) if source_id is not None else None)
+    expires_at = normalize_expiry(expires_at) if expires_at is not None else expiry_from_env("EXPERIENCE_TTL_DAYS", 0)
     conn = get_db_connection()
     if not conn:
         return None
@@ -51,8 +52,10 @@ def save_experience(user_id: str = DEFAULT_USER_ID, title: str = "", lesson: str
         _ensure_experience_table(conn)
         cursor = conn.cursor(dictionary=True)
         cursor.execute(
-            "INSERT INTO agent_experiences (user_id, title, lesson, context, source_type, source_id) VALUES (%s, %s, %s, %s, %s, %s)",
-            (user_id, title[:255], lesson, str(context or ""), source_type[:50], source_id),
+            "INSERT INTO agent_experiences "
+            "(user_id, title, lesson, context, source_type, source_id, source_ref, confidence, importance, expires_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (user_id, title[:255], lesson, str(context or ""), source_type, source_id, source_ref, confidence, importance, expires_at),
         )
         experience_id = cursor.lastrowid
         conn.commit()
@@ -64,6 +67,10 @@ def save_experience(user_id: str = DEFAULT_USER_ID, title: str = "", lesson: str
             "context": context,
             "source_type": source_type,
             "source_id": source_id,
+            "source_ref": source_ref,
+            "confidence": confidence,
+            "importance": importance,
+            "expires_at": expires_at,
         }
     except Exception as exc:
         print(f"Lỗi lưu experience: {exc}")
@@ -83,7 +90,14 @@ def list_experiences(user_id: str = DEFAULT_USER_ID, limit: int = 20) -> list[di
     try:
         _ensure_experience_table(conn)
         cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT id, user_id, title, lesson, context, source_type, source_id, created_at FROM agent_experiences WHERE user_id = %s ORDER BY id DESC LIMIT %s", (user_id, max(1, min(int(limit), 50))))
+        cursor.execute(
+            "SELECT id, user_id, title, lesson, context, source_type, source_id, source_ref, "
+            "confidence, importance, expires_at, created_at FROM agent_experiences "
+            "WHERE user_id = %s AND forgotten_at IS NULL "
+            "AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP) "
+            "ORDER BY id DESC LIMIT %s",
+            (user_id, max(1, min(int(limit), 50))),
+        )
         return [dict(item) for item in (cursor.fetchall() or [])]
     finally:
         if conn.is_connected():

@@ -14,28 +14,9 @@ GOAL_STATUSES = frozenset({"active", "paused", "completed", "archived"})
 def _ensure_goal_table(conn) -> None:
     if not conn:
         return
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS personal_goals (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                user_id VARCHAR(100) NOT NULL DEFAULT 'default',
-                title VARCHAR(255) NOT NULL,
-                description TEXT,
-                status VARCHAR(30) NOT NULL DEFAULT 'active',
-                priority INT NOT NULL DEFAULT 3,
-                progress INT NOT NULL DEFAULT 0,
-                target_date DATE NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                INDEX idx_goals_user_status (user_id, status)
-            )
-            """
-        )
-        conn.commit()
-    finally:
-        cursor.close()
+    from core.migrations import ensure_schema
+
+    ensure_schema(conn)
 
 
 def _validate_title(title: str) -> str:

@@ -18,6 +18,18 @@ cp .env.example .env
 
 Điền các biến trong `backend/.env`: provider/model LLM, thông tin MySQL và API key nếu dùng Gemini. Không commit hoặc chia sẻ file `.env`.
 
+## Migration database
+
+Toàn bộ schema MySQL được quản lý tại `backend/core/migrations.py`. Backend tự chạy các migration còn thiếu trước khi khởi động agent và ghi version, tên, checksum vào `schema_migrations`. Nếu MySQL chưa chạy, server vẫn mở để health check báo lỗi và service sẽ thử migration lại khi database hoạt động; nếu checksum của migration đã áp dụng bị lệch, startup dừng để tránh chạy với schema không xác định.
+
+Chạy migration thủ công từ thư mục `backend`:
+
+```bash
+venv/bin/python -m core.migrations
+```
+
+Migration đã áp dụng không được sửa nội dung; thay đổi schema tiếp theo phải thêm version mới vào `MIGRATIONS`. Các service chỉ gọi `ensure_schema()` làm lớp bảo vệ và không chứa DDL riêng.
+
 ## Chạy development
 
 Frontend:
@@ -66,10 +78,19 @@ Ngữ cảnh hội thoại ngắn hạn mặc định giữ tối đa khoảng 6
 
 ### Hội thoại và bộ nhớ cá nhân
 
+- `backend/services/memory_orchestrator.py` là ranh giới ứng dụng chung cho việc ghi lượt chat, trích/củng cố fact, dựng context cho model, đọc long-term memory và sửa/xóa memory. Chat thường, streaming, proactive scheduler, self-learning, research và memory API đều đi qua orchestrator; các service cũ tiếp tục làm lớp truy cập MySQL.
+- Trước khi tạo prompt, orchestrator đọc history, personal memory, knowledge và experience theo đúng `user_id`, rồi ghép runtime context đã rút gọn nếu agent có snapshot. Knowledge/experience được xếp hạng theo tin nhắn hiện tại và các lời gần đây của người dùng; lời cũ của AI không được dùng để chọn dữ liệu. Các giới hạn nằm ở `MEMORY_ARCHIVAL_CANDIDATE_LIMIT` và `MEMORY_ARCHIVAL_RECALL_LIMIT`.
+- Lượt có dữ liệu tra cứu thời gian thực không trộn knowledge/experience lưu trước đó vào prompt. Khi vượt ngân sách ký tự, hệ thống bỏ lịch sử cũ, runtime và dữ liệu archive trước khi bỏ personal memory đã xác thực.
+- Một fact giống hệt được nhắc lại sẽ tăng `occurrence_count` thay vì tạo thêm bản ghi. Thay đổi hoặc phủ định fact vô hiệu hóa đúng bản cũ, liên kết nó với bản thay thế và loại các lượt chat nguồn khỏi context.
+- Mỗi lượt hoàn tất được nén vào `conversation_sessions`; khoảng im lặng mặc định 30 phút mở phiên mới. `episodic_memories` chỉ nhận sự kiện ngôi thứ nhất có dấu hiệu rõ như thành tựu, quyết định, cảm xúc hoặc việc vừa xảy ra. Session lưu `start_chat_id`, episode lưu `source_chat_id`, nên dữ liệu trước mốc sửa/xóa memory không quay lại context.
+- Recall chung chọn session summary và episode theo lời người dùng, rồi ghép cùng history, personal memory, knowledge, experience và runtime context. Có thể kiểm tra dữ liệu qua `GET /api/conversation-memory`; giới hạn nằm ở `SESSION_*` và `EPISODIC_MEMORY_*` trong `backend/.env.example`.
+- Xếp hạng memory dùng hybrid retrieval trên toàn bộ các kho trong một lượt: TF-IDF theo độ hiếm, khớp cụm từ, ký tự n-gram chịu lỗi gõ và độ mới. Có thể bật cosine semantic bằng `qwen3-embedding:0.6b`; embedding được batch, cache trong tiến trình và tự hạ về lexical khi Ollama/model lỗi. Cấu hình nằm ở `MEMORY_EMBEDDING_*` và `MEMORY_RETRIEVAL_*`.
+- Personal memory, knowledge, experience, session summary và episodic memory đều có `confidence`, `importance`, thông tin nguồn và `expires_at`. Truy vấn DB loại bản ghi hết hạn; recall kiểm tra lại, bỏ dữ liệu dưới `MEMORY_MIN_CONFIDENCE` và dùng confidence/importance làm trọng số xếp hạng. Knowledge mặc định hết hạn sau 30 ngày, session sau 90 ngày, episode sau 365 ngày; experience không tự hết hạn. Có thể đổi các mốc bằng `*_TTL_DAYS` trong `backend/.env`.
+- Quên có mục tiêu giữ nguyên dữ liệu không liên quan: fact bị thay thế được đánh dấu `superseded` và trỏ tới bản mới; dữ liệu hết hạn được scheduler đánh dấu `expired`; yêu cầu xóa trực tiếp vẫn xóa đúng personal memory được chọn. `GET /api/memory-audit` cho phép xem quan hệ và lý do, còn `POST /api/memories/forget-expired` chạy dọn theo một `user_id`. Chu kỳ tự động nằm ở `MEMORY_FORGET_SWEEP_SECONDS`.
 - Giao diện hiển thị trạng thái kết nối, nút kiểm tra lại và lịch sử hội thoại tải từ MySQL. `GET /api/chat/history?user_id=default&limit=50` trả lịch sử để mở lại ứng dụng; `limit` tối đa 100.
 - Trong **Bộ nhớ của bạn**, dùng **Sửa → Lưu** hoặc **×** để xóa. `PATCH /api/memories/{id}?user_id=default` nhận `{ "fact": "Thông tin mới" }`; endpoint xóa giữ nguyên. API trả 404 nếu không tìm thấy bộ nhớ của user đó, 503 nếu DB lỗi.
 - Các câu trực tiếp như `Mình tên là Nguyễn Văn An`, `Mình thích trà`, `Mình học Python`, `Mình không còn thích trà nữa` được ghi nhận trước khi tạo câu trả lời. Đổi tên thay thế tên cũ; đổi sở thích hoặc ngừng học thay thế thông tin cùng chủ đề, giữ những chủ đề khác.
-- Sau khi sửa/xóa hoặc thay thế thông tin cũ, hệ thống đặt mốc context trong bảng `memory_context_state`. Lịch sử trước mốc vẫn đọc được trên giao diện nhưng không được gửi lại cho LLM; việc này tránh thông tin đã quên quay lại từ lịch sử. Xóa/sửa tên cũng cập nhật hồ sơ và timeline. Đây không phải thao tác xóa toàn bộ bản ghi hội thoại.
+- Sau khi sửa/xóa hoặc thay thế thông tin có `source_ref`, hệ thống ghi đúng lượt người dùng và câu trả lời phụ thuộc vào `memory_context_exclusions`; các lượt không liên quan vẫn vào context bình thường. Bản ghi cũ chưa có provenance tiếp tục dùng `memory_context_state` làm phương án an toàn. Lịch sử vẫn đọc được trên giao diện. Xóa/sửa tên cũng cập nhật hồ sơ và timeline.
 - Tự trích xuất dùng các mẫu câu tiếng Việt trực tiếp, chưa xử lý mọi cách diễn đạt. Có thể sửa thủ công khi cần. Không trích xuất câu hỏi, câu được trích dẫn hoặc ví dụ có tiền tố.
 - Chat và sửa/xóa bộ nhớ được tuần tự hóa theo user trong tiến trình. Chạy local với một worker; chưa hỗ trợ phối hợp khóa giữa nhiều worker hoặc xác thực nhiều tài khoản.
 

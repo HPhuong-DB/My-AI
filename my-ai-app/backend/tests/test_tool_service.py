@@ -117,8 +117,9 @@ class ToolServiceTests(unittest.TestCase):
         self.assertIn("message", summary["reminders"][0])
 
     @patch.object(tool_service, "deliver_due_reminder_notifications")
+    @patch.object(tool_service, "_ensure_tool_tables")
     @patch.object(tool_service, "get_db_connection")
-    def test_poll_due_reminder_notifications_for_all_users(self, get_connection, deliver_mock):
+    def test_poll_due_reminder_notifications_for_all_users(self, get_connection, ensure_tables, deliver_mock):
         cursor = FakeCursor(fetchall_result=[{"user_id": "user-1"}, {"user_id": "user-2"}])
         connection = FakeConnection(cursor)
         get_connection.return_value = connection
@@ -133,6 +134,7 @@ class ToolServiceTests(unittest.TestCase):
         self.assertEqual(result[0]["user_id"], "user-1")
         self.assertEqual(result[0]["count"], 1)
         self.assertEqual(result[1]["user_id"], "user-2")
+        ensure_tables.assert_called_once_with(connection)
 
     @patch.object(tool_service, "_ensure_tool_tables")
     @patch.object(tool_service, "get_db_connection")

@@ -14,7 +14,7 @@ class SelfLearningServiceTests(unittest.TestCase):
     def setUp(self):
         self.service = SelfLearningService(StateManager(), max_updates=2, window_seconds=3600)
 
-    @patch("services.self_learning_service.save_memory", return_value=True)
+    @patch("services.self_learning_service.memory_orchestrator.remember", return_value=True)
     def test_memory_learning_uses_only_memory_store(self, save_memory_mock):
         result = self.service.learn(
             "user-1",
@@ -25,9 +25,17 @@ class SelfLearningServiceTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["target"], "memory")
-        save_memory_mock.assert_called_once_with("learned_fact", "Người dùng thích trà đào.", "user-1")
+        save_memory_mock.assert_called_once_with(
+            "learned_fact",
+            "Người dùng thích trà đào.",
+            "user-1",
+            confidence=0.65,
+            importance=0.6,
+            source_type="self_learning",
+            source_ref="Sở thích",
+        )
 
-    @patch("services.self_learning_service.save_knowledge", return_value={"id": 1})
+    @patch("services.self_learning_service.memory_orchestrator.remember_knowledge", return_value={"id": 1})
     def test_knowledge_learning_is_bounded_to_knowledge_store(self, save_knowledge_mock):
         result = self.service.learn(
             "user-1",
@@ -52,7 +60,7 @@ class SelfLearningServiceTests(unittest.TestCase):
         with self.assertRaises(SelfLearningError):
             self.service.learn("user-1", target="memory", title="x", content="y")
 
-    @patch("services.self_learning_service.save_memory", return_value=True)
+    @patch("services.self_learning_service.memory_orchestrator.remember", return_value=True)
     def test_learning_rate_limit_is_enforced(self, save_memory_mock):
         for index in range(2):
             self.service.learn("user-1", target="memory", title=str(index), content="fact")

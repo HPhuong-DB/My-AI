@@ -5,6 +5,7 @@ from unittest.mock import patch
 from api.chat import _clean_visible_reply
 from services.dialogue_context_service import build_dialogue_context, select_memories, pronoun_instruction
 from services import llm_service
+from services import memory_orchestrator as orchestrator_module
 
 
 MEMORIES = [
@@ -86,18 +87,66 @@ class DialogueContextTests(unittest.TestCase):
         self.assertNotIn('người dùng đang buồn', prompt.lower())
         self.assertNotIn('CHƯA BIẾT TÊN', prompt)
 
-    @patch.object(llm_service, 'get_user_profile', return_value=None)
-    @patch.object(llm_service, 'get_recent_memories', return_value=[])
-    @patch.object(llm_service, 'get_recent_chat_history', return_value=[])
+    @patch.object(orchestrator_module, 'get_user_profile', return_value=None)
+    @patch.object(orchestrator_module, 'get_recent_memories', return_value=[])
+    @patch.object(orchestrator_module, 'get_recent_chat_history', return_value=[])
     def test_context_reads_are_user_scoped_and_fail_closed(self, history, memories, profile):
-        llm_service._build_context_data('Xin chào', 'isolated-user', 'fast')
-        self.assertEqual(history.call_args.kwargs['user_id'], 'isolated-user')
-        self.assertEqual(history.call_args.kwargs['limit'], 13)
-        self.assertTrue(history.call_args.kwargs['strict'])
-        self.assertTrue(memories.call_args.kwargs['strict'])
-        self.assertEqual(profile.call_args.kwargs['user_id'], 'isolated-user')
-        llm_service._build_context_data('Phân tích thêm', 'isolated-user', 'deep')
-        self.assertEqual(history.call_args.kwargs['limit'], 17)
+        with patch.object(llm_service.memory_orchestrator, '_load_archival_candidates', return_value=([], [])), patch.object(
+            llm_service.memory_orchestrator, '_load_conversation_candidates', return_value=([], [])
+        ):
+            llm_service._build_context_data('Xin chào', 'isolated-user', 'fast')
+            self.assertEqual(history.call_args.kwargs['user_id'], 'isolated-user')
+            self.assertEqual(history.call_args.kwargs['limit'], 13)
+            self.assertTrue(history.call_args.kwargs['strict'])
+            self.assertTrue(memories.call_args.kwargs['strict'])
+            self.assertEqual(profile.call_args.kwargs['user_id'], 'isolated-user')
+            llm_service._build_context_data('Phân tích thêm', 'isolated-user', 'deep')
+            self.assertEqual(history.call_args.kwargs['limit'], 17)
+
+    def test_tight_budget_drops_archive_before_personal_memory(self):
+        prompt = build_dialogue_context(
+            'Chào',
+            [],
+            [{'memory_type': 'communication_style', 'fact': 'Huohuo xưng tớ, gọi người dùng là cậu'}],
+            None,
+            max_chars=500,
+            runtime_context={'current_topic': 'x' * 500},
+            knowledge=[{'title': 'Dữ liệu cũ', 'summary': 'y' * 800, 'key_points': []}],
+            experiences=[{'title': 'Bài học cũ', 'lesson': 'z' * 800, 'context': ''}],
+        )
+        evidence = json.loads(prompt.evidence)
+
+        self.assertNotIn('ngu_canh_tuc_thoi', evidence)
+        self.assertNotIn('kien_thuc_lien_quan', evidence)
+        self.assertNotIn('kinh_nghiem_lien_quan', evidence)
+        self.assertEqual(evidence['ky_uc_lien_quan'][0]['loai'], 'communication_style')
+
+    def test_session_summary_does_not_duplicate_turns_already_in_history(self):
+        prompt = build_dialogue_context(
+            'Kể tiếp đi',
+            [
+                {'role': 'user', 'content': 'Mình đang học Rust'},
+                {'role': 'assistant', 'content': 'Hãy bắt đầu với ownership'},
+            ],
+            [],
+            None,
+            session_summaries=[{
+                'topics': ['rust'],
+                'user_points': [
+                    {'chat_id': 1, 'text': 'Trước đó mình học Python'},
+                    {'chat_id': 2, 'text': 'Mình đang học Rust'},
+                ],
+                'assistant_points': [
+                    {'chat_id': 1, 'text': 'Python có cú pháp dễ đọc'},
+                    {'chat_id': 2, 'text': 'Hãy bắt đầu với ownership'},
+                ],
+            }],
+        )
+        evidence = json.loads(prompt.evidence)
+        summary = evidence['tom_tat_phien_lien_quan'][0]
+
+        self.assertEqual(summary['nguoi_dung_da_noi'], ['Trước đó mình học Python'])
+        self.assertEqual(summary['Huohuo_da_tra_loi'], ['Python có cú pháp dễ đọc'])
 
     def test_recent_six_exchanges_survive_context_budget(self):
         history = []

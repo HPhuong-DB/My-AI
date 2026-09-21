@@ -27,10 +27,11 @@ class FakeConnection:
 
 
 class FakeCursor:
-    def __init__(self, fetchone_result=None, fetchall_result=None, rowcount=0):
+    def __init__(self, fetchone_result=None, fetchall_result=None, rowcount=0, lastrowid=None):
         self.fetchone_result = fetchone_result
         self.fetchall_result = fetchall_result or []
         self.rowcount = rowcount
+        self.lastrowid = lastrowid
         self.executed = []
         self.closed = False
 
@@ -82,8 +83,28 @@ class MemoryServiceTests(unittest.TestCase):
 
         self.assertTrue(connection.committed)
         inserted = [(sql, params) for sql, params in cursor.executed if sql.startswith("INSERT INTO core_memories")]
-        self.assertEqual(inserted[0][1], ("user-1", "preference", "Người dùng thích trà"))
+        self.assertEqual(
+            inserted[0][1],
+            ("user-1", "preference", "Người dùng thích trà", 0.9, 0.75, "conversation", None, None),
+        )
         self.assertIn("is_active", inserted[0][0])
+        self.assertIn("confidence", inserted[0][0])
+        ensure_tables.assert_called_once_with(connection)
+
+    @patch.object(memory_service, "_ensure_memory_tables")
+    @patch.object(memory_service, "get_db_connection")
+    def test_repeated_fact_is_consolidated_instead_of_duplicated(self, get_connection, ensure_tables):
+        cursor = FakeCursor(fetchall_result=[{"id": 7, "fact": "Người dùng thích trà"}])
+        connection = FakeConnection(cursor)
+        get_connection.return_value = connection
+
+        self.assertTrue(memory_service.save_memory("preference", "Người dùng thích trà", user_id="user-1"))
+
+        updates = [(sql, params) for sql, params in cursor.executed if "occurrence_count = occurrence_count + 1" in sql]
+        inserts = [(sql, params) for sql, params in cursor.executed if sql.startswith("INSERT INTO core_memories")]
+        self.assertEqual(updates[0][1], (0.9, 0.75, "conversation", None, None, 7, "user-1"))
+        self.assertEqual(inserts, [])
+        self.assertTrue(connection.committed)
         ensure_tables.assert_called_once_with(connection)
 
     @patch.object(memory_service, "_ensure_memory_tables")
@@ -106,6 +127,7 @@ class MemoryServiceTests(unittest.TestCase):
         self.assertEqual(result, rows)
         self.assertEqual(cursor.executed[0][1], ("user-1", 10))
         self.assertIn("is_active = 1", cursor.executed[0][0])
+        self.assertIn("expires_at > CURRENT_TIMESTAMP", cursor.executed[0][0])
         ensure_tables.assert_called_once_with(connection)
 
     @patch.object(memory_service, "_ensure_memory_tables")
