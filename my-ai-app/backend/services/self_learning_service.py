@@ -7,9 +7,7 @@ from collections import defaultdict, deque
 from typing import Any
 
 from agent.state_manager import StateManager
-from services.knowledge_service import save_experience
-from services.memory_service import save_memory
-from services.research_service import save_knowledge
+from services.memory_orchestrator import memory_orchestrator
 
 
 class SelfLearningError(ValueError):
@@ -87,18 +85,40 @@ class SelfLearningService:
         self._check_rate(user_id)
 
         if target == "memory":
-            stored = save_memory("learned_fact", content, user_id)
+            stored = memory_orchestrator.remember(
+                "learned_fact",
+                content,
+                user_id,
+                confidence=0.65,
+                importance=0.60,
+                source_type="self_learning",
+                source_ref=source_url or title,
+            )
         elif target == "experience":
-            stored = save_experience(
+            stored = memory_orchestrator.remember_experience(
                 user_id,
                 title,
                 content,
                 context,
                 source_type="self_learning",
+                source_ref=source_url or title,
+                confidence=0.70,
+                importance=0.65,
             )
         else:
             sources = [{"url": source_url, "title": title}] if source_url else []
-            stored = save_knowledge(user_id, title, title, content, [content], sources)
+            stored = memory_orchestrator.remember_knowledge(
+                user_id,
+                title,
+                title,
+                content,
+                [content],
+                sources,
+                confidence=0.65,
+                importance=0.60,
+                source_type="self_learning",
+                source_ref=source_url or title,
+            )
 
         if stored is None or stored is False:
             return {"ok": False, "target": target, "error": "database_unavailable"}

@@ -84,13 +84,13 @@ class ChatReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("MySQL", body)
         self.assertNotIn("event: complete", body)
 
-    async def test_memory_changes_are_committed_before_user_history(self):
+    async def test_memory_orchestrator_runs_after_observation_boundary(self):
         order = []
-        with patch.object(chat, "observe_message", side_effect=lambda *a: order.append("boundary")), patch.object(chat, "save_memory_from_conversation", side_effect=lambda *a, **kw: order.append("memory")), patch.object(chat, "save_chat_message", side_effect=lambda *a, **kw: order.append("history")), patch.object(chat, "trigger_due_reminder_notification", return_value={}):
+        with patch.object(chat, "observe_message", side_effect=lambda *a: order.append("boundary")), patch.object(chat.memory_orchestrator, "prepare_user_turn", side_effect=lambda *a, **kw: order.append("orchestrator")), patch.object(chat, "trigger_due_reminder_notification", return_value={}):
             from schemas.message import ChatRequest
             task = await chat._prepare_chat(ChatRequest(text="Mình không còn thích trà"))
             await task
-        self.assertEqual(order, ["boundary", "memory", "history"])
+        self.assertEqual(order, ["boundary", "orchestrator"])
 
 
 if __name__ == "__main__":

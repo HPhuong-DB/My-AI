@@ -1,7 +1,9 @@
 import re
 import os
+import hashlib
 
 from core.database import DatabaseUnavailable, get_db_connection
+from services.memory_metadata import clamp_score, normalize_expiry
 
 DEFAULT_USER_ID = os.getenv("DEFAULT_USER_ID", "default")
 
@@ -9,90 +11,42 @@ DEFAULT_USER_ID = os.getenv("DEFAULT_USER_ID", "default")
 def _ensure_memory_tables(conn):
     if not conn:
         return
+    from core.migrations import ensure_schema
 
-    cursor = conn.cursor()
-    try:
+    ensure_schema(conn)
+
+
+def _invalidate_history(cursor, user_id, source_refs=None, reason="memory_changed"):
+    """Exclude only transcript turns that produced the changed memory."""
+    refs = [str(ref) for ref in (source_refs or []) if str(ref or "").startswith("user_message:")]
+    if not refs:
+        # Records created before provenance metadata cannot be mapped safely.
         cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS core_memories (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                user_id VARCHAR(100) NOT NULL DEFAULT 'default',
-                memory_type VARCHAR(50) NOT NULL,
-                fact TEXT NOT NULL,
-                occurrence_count INT DEFAULT 1,
-                is_active TINYINT(1) DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """
+            "INSERT INTO memory_context_state (user_id, cutoff_chat_id) "
+            "SELECT %s, COALESCE(MAX(id), 0) FROM chat_history WHERE user_id = %s "
+            "ON DUPLICATE KEY UPDATE cutoff_chat_id = VALUES(cutoff_chat_id)",
+            (user_id, user_id),
+        )
+        return
+    for source_ref in set(refs):
+        fingerprint = source_ref.split(":", 1)[1]
+        cursor.execute(
+            "INSERT IGNORE INTO memory_context_exclusions (user_id, chat_id, source_ref, reason) "
+            "SELECT %s, id, %s, %s FROM chat_history WHERE user_id = %s AND role = 'user' "
+            "AND LOWER(LEFT(SHA2(TRIM(content), 256), 16)) = %s",
+            (user_id, source_ref, reason, user_id, fingerprint),
         )
         cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_profiles (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                user_id VARCHAR(100) NOT NULL DEFAULT 'default',
-                username VARCHAR(50) NOT NULL,
-                affection_level INT DEFAULT 0,
-                mood VARCHAR(50) DEFAULT 'neutral',
-                interaction_count INT DEFAULT 0,
-                last_interaction TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-            )
-            """
+            "INSERT IGNORE INTO memory_context_exclusions (user_id, chat_id, source_ref, reason) "
+            "SELECT %s, MIN(reply.id), %s, %s FROM chat_history origin "
+            "JOIN chat_history reply ON reply.user_id = origin.user_id AND reply.role = 'assistant' "
+            "AND reply.id > origin.id WHERE origin.user_id = %s AND origin.role = 'user' "
+            "AND LOWER(LEFT(SHA2(TRIM(origin.content), 256), 16)) = %s "
+            "AND NOT EXISTS (SELECT 1 FROM chat_history intervening WHERE intervening.user_id = origin.user_id "
+            "AND intervening.role = 'user' AND intervening.id > origin.id AND intervening.id < reply.id) "
+            "GROUP BY origin.id",
+            (user_id, source_ref, reason, user_id, fingerprint),
         )
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_mood_timeline (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                user_id VARCHAR(100) NOT NULL DEFAULT 'default',
-                username VARCHAR(50) NOT NULL,
-                mood VARCHAR(50) DEFAULT 'neutral',
-                affection_level INT DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-
-        cursor.execute("SHOW COLUMNS FROM core_memories LIKE 'occurrence_count'")
-        if cursor.fetchone() is None:
-            cursor.execute("ALTER TABLE core_memories ADD COLUMN occurrence_count INT DEFAULT 1")
-
-        cursor.execute("SHOW COLUMNS FROM core_memories LIKE 'is_active'")
-        if cursor.fetchone() is None:
-            cursor.execute("ALTER TABLE core_memories ADD COLUMN is_active TINYINT(1) DEFAULT 0")
-
-        cursor.execute("SHOW COLUMNS FROM core_memories LIKE 'user_id'")
-        if cursor.fetchone() is None:
-            cursor.execute("ALTER TABLE core_memories ADD COLUMN user_id VARCHAR(100) NOT NULL DEFAULT 'default'")
-
-        cursor.execute("SHOW COLUMNS FROM user_profiles LIKE 'user_id'")
-        if cursor.fetchone() is None:
-            cursor.execute("ALTER TABLE user_profiles ADD COLUMN user_id VARCHAR(100) NOT NULL DEFAULT 'default'")
-
-        cursor.execute("SHOW COLUMNS FROM user_profiles LIKE 'mood'")
-        if cursor.fetchone() is None:
-            cursor.execute("ALTER TABLE user_profiles ADD COLUMN mood VARCHAR(50) DEFAULT 'neutral'")
-
-        cursor.execute("SHOW COLUMNS FROM user_profiles LIKE 'interaction_count'")
-        if cursor.fetchone() is None:
-            cursor.execute("ALTER TABLE user_profiles ADD COLUMN interaction_count INT DEFAULT 0")
-
-        cursor.execute("CREATE TABLE IF NOT EXISTS memory_context_state (user_id VARCHAR(100) PRIMARY KEY, cutoff_chat_id INT NOT NULL DEFAULT 0)")
-
-        # Dọn các memory tạm thời được tạo bởi phiên bản cũ.
-        cursor.execute("UPDATE core_memories SET is_active = 0 WHERE memory_type = 'recent_reply'")
-
-        conn.commit()
-    finally:
-        cursor.close()
-
-
-def _invalidate_history(cursor, user_id):
-    # Keep the transcript visible, but never reintroduce superseded personal facts.
-    cursor.execute(
-        "INSERT INTO memory_context_state (user_id, cutoff_chat_id) "
-        "SELECT %s, COALESCE(MAX(id), 0) FROM chat_history WHERE user_id = %s "
-        "ON DUPLICATE KEY UPDATE cutoff_chat_id = VALUES(cutoff_chat_id)",
-        (user_id, user_id),
-    )
 
 
 def _subject(memory_type, fact):
@@ -103,10 +57,36 @@ def _subject(memory_type, fact):
     return re.sub(prefixes.get(memory_type, r"^$"), "", fact, flags=re.I).strip().rstrip(".!?").casefold()
 
 
-def save_memory(memory_type, fact, user_id=DEFAULT_USER_ID, *, strict=False):
+def _default_importance(memory_type):
+    return {
+        "user_name": 0.95,
+        "communication_style": 0.90,
+        "goal": 0.85,
+        "preference": 0.75,
+        "learned_fact": 0.60,
+    }.get(str(memory_type or ""), 0.70)
+
+
+def save_memory(
+    memory_type,
+    fact,
+    user_id=DEFAULT_USER_ID,
+    *,
+    confidence=0.90,
+    importance=None,
+    source_type="conversation",
+    source_ref=None,
+    expires_at=None,
+    strict=False,
+):
     if not memory_type or not fact or not fact.strip():
         return False
     fact = fact.strip()
+    confidence = clamp_score(confidence, 0.90)
+    importance = clamp_score(importance, _default_importance(memory_type))
+    source_type = str(source_type or "conversation")[:50]
+    source_ref = str(source_ref)[:255] if source_ref not in (None, "") else None
+    expires_at = normalize_expiry(expires_at)
     conn = get_db_connection()
     if not conn:
         if strict:
@@ -118,17 +98,41 @@ def save_memory(memory_type, fact, user_id=DEFAULT_USER_ID, *, strict=False):
         from services.chat_service import _ensure_table_exists
         _ensure_table_exists(conn)
         cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT id, fact FROM core_memories WHERE user_id = %s AND memory_type = %s AND is_active = 1 FOR UPDATE", (user_id, memory_type))
+        cursor.execute("SELECT id, fact, source_ref FROM core_memories WHERE user_id = %s AND memory_type = %s AND is_active = 1 FOR UPDATE", (user_id, memory_type))
         existing = cursor.fetchall() or []
         matching = [row for row in existing if memory_type in {"user_name", "communication_style"} or _subject(memory_type, row["fact"]) == _subject(memory_type, fact)]
         if len(matching) == 1 and matching[0]["fact"].casefold() == fact.casefold():
+            cursor.execute(
+                "UPDATE core_memories SET occurrence_count = occurrence_count + 1, "
+                "confidence = GREATEST(confidence, %s), importance = GREATEST(importance, %s), "
+                "source_type = %s, source_ref = COALESCE(%s, source_ref), "
+                "expires_at = %s, last_confirmed_at = CURRENT_TIMESTAMP "
+                "WHERE id = %s AND user_id = %s",
+                (confidence, importance, source_type, source_ref, expires_at, matching[0]["id"], user_id),
+            )
             conn.commit()
             return True
+        if matching:
+            _invalidate_history(
+                cursor,
+                user_id,
+                [row.get("source_ref") for row in matching],
+                reason="superseded",
+            )
+        cursor.execute(
+            "INSERT INTO core_memories "
+            "(user_id, memory_type, fact, occurrence_count, is_active, confidence, importance, source_type, source_ref, expires_at) "
+            "VALUES (%s, %s, %s, 1, 1, %s, %s, %s, %s, %s)",
+            (user_id, memory_type, fact, confidence, importance, source_type, source_ref, expires_at),
+        )
+        new_memory_id = getattr(cursor, "lastrowid", None)
         for row in matching:
-            cursor.execute("UPDATE core_memories SET is_active = 0 WHERE id = %s AND user_id = %s", (row["id"], user_id))
-        if matching or memory_type == "user_name" or fact.startswith("Người dùng không"):
-            _invalidate_history(cursor, user_id)
-        cursor.execute("INSERT INTO core_memories (user_id, memory_type, fact, occurrence_count, is_active) VALUES (%s, %s, %s, 1, 1)", (user_id, memory_type, fact))
+            cursor.execute(
+                "UPDATE core_memories SET is_active = 0, forgotten_at = CURRENT_TIMESTAMP, "
+                "forget_reason = 'superseded', superseded_by_id = %s "
+                "WHERE id = %s AND user_id = %s",
+                (new_memory_id, row["id"], user_id),
+            )
         if memory_type == "user_name":
             cursor.execute("UPDATE user_profiles SET username = %s WHERE user_id = %s", (fact.removeprefix("Tên người dùng là "), user_id))
         conn.commit()
@@ -156,14 +160,15 @@ def get_recent_memories(limit=5, user_id=DEFAULT_USER_ID, *, strict=False):
             _ensure_memory_tables(conn)
             cursor = conn.cursor(dictionary=True)
             cursor.execute(
-                "SELECT id, user_id, memory_type, fact FROM core_memories WHERE user_id = %s AND is_active = 1 ORDER BY id DESC LIMIT %s",
+                "SELECT id, user_id, memory_type, fact, confidence, importance, source_type, source_ref, "
+                "expires_at, last_confirmed_at, created_at FROM core_memories "
+                "WHERE user_id = %s AND is_active = 1 AND forgotten_at IS NULL "
+                "AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP) "
+                "ORDER BY id DESC LIMIT %s",
                 (user_id, limit),
             )
             rows = cursor.fetchall()
-            memories = [
-                {"id": row["id"], "user_id": row["user_id"], "memory_type": row["memory_type"], "fact": row["fact"]}
-                for row in rows
-            ]
+            memories = [dict(row) for row in rows]
         except Exception as e:
             if strict:
                 raise DatabaseUnavailable("Không thể đọc bộ nhớ") from e
@@ -376,6 +381,8 @@ def save_memory_from_conversation(user_message, assistant_reply, user_id=DEFAULT
     if not user_message:
         return
     user_text = user_message.strip()
+    source_ref = "user_message:" + hashlib.sha256(user_text.encode("utf-8")).hexdigest()[:16]
+    memory_kwargs = {"source_type": "conversation", "source_ref": source_ref, "strict": strict}
     mood, affection_delta = infer_relationship_state(user_text)
     # Only direct statements, never questions or quoted/conditional examples.
     direct_text = re.sub(r'''```[\s\S]*?```|`[^`]*`|“[^”]*”|「[^」]*」|"[^"]*"|'[^']*' ''', ' ', user_text, flags=re.X)
@@ -388,22 +395,22 @@ def save_memory_from_conversation(user_message, assistant_reply, user_id=DEFAULT
         if not addressed and re.match(r"(?:(?:từ giờ|bạn|cậu|huohuo)\s+)*xưng\s+(?:là\s+)?(?:tớ|mình|tôi|em|anh|chị)\s*(?:,|và)\s*gọi\b", statement, re.I):
             addressed = re.search(r"gọi\s+(?:mình|tôi|tớ)\s+(?:là\s+)?(cậu|bạn|anh|chị|em)\b", statement, re.I)
         if addressed and self_pronoun:
-            save_memory("communication_style", f"Huohuo xưng {self_pronoun.group(1).lower()}, gọi người dùng là {addressed.group(1).lower()}", user_id, strict=strict)
+            save_memory("communication_style", f"Huohuo xưng {self_pronoun.group(1).lower()}, gọi người dùng là {addressed.group(1).lower()}", user_id, **memory_kwargs)
             continue
         name = _extract_name(statement)
         if name:
-            save_memory("user_name", f"Tên người dùng là {name}", user_id, strict=strict)
+            save_memory("user_name", f"Tên người dùng là {name}", user_id, **memory_kwargs)
         preference = _extract_preference(statement)
         goal = _extract_goal(statement)
         if preference:
-            save_memory("preference", f"Người dùng thích {preference}", user_id, strict=strict)
+            save_memory("preference", f"Người dùng thích {preference}", user_id, **memory_kwargs)
         if goal:
-            save_memory("goal", f"Người dùng đang học {goal}", user_id, strict=strict)
+            save_memory("goal", f"Người dùng đang học {goal}", user_id, **memory_kwargs)
         negative = re.fullmatch(r"(?:tôi|mình|tớ)\s+không\s+(?:còn\s+)?(thích|học)\s+(.+?)(?:\s+nữa)?", statement, re.I)
         if negative:
             verb, subject = negative.groups()
             kind = "preference" if verb.lower() == "thích" else "goal"
-            save_memory(kind, f"Người dùng không còn {verb.lower()} {subject}", user_id, strict=strict)
+            save_memory(kind, f"Người dùng không còn {verb.lower()} {subject}", user_id, **memory_kwargs)
     existing = get_user_profile(user_id=user_id)
     names = [m for m in get_recent_memories(100, user_id) if m["memory_type"] == "user_name"]
     profile_name = names[0]["fact"].removeprefix("Tên người dùng là ") if names else (existing or {}).get("username") or "Bạn"
@@ -420,7 +427,7 @@ def _mutate_memory(memory_id, user_id, fact=None):
         from services.chat_service import _ensure_table_exists
         _ensure_table_exists(conn)
         cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT id, memory_type, fact FROM core_memories WHERE id = %s AND user_id = %s AND is_active = 1 FOR UPDATE", (memory_id, user_id))
+        cursor.execute("SELECT id, memory_type, fact, source_ref FROM core_memories WHERE id = %s AND user_id = %s AND is_active = 1 FOR UPDATE", (memory_id, user_id))
         memory = cursor.fetchone()
         if not memory:
             conn.rollback()
@@ -435,18 +442,44 @@ def _mutate_memory(memory_id, user_id, fact=None):
                     raise ValueError("Tên phải có từ 1 đến 50 ký tự")
                 fact = f"Tên người dùng là {name}"
             # Editing into an existing subject must not leave contradictory active facts.
-            cursor.execute("SELECT id, fact FROM core_memories WHERE user_id = %s AND memory_type = %s AND is_active = 1 FOR UPDATE", (user_id, memory["memory_type"]))
+            cursor.execute("SELECT id, fact, source_ref FROM core_memories WHERE user_id = %s AND memory_type = %s AND is_active = 1 FOR UPDATE", (user_id, memory["memory_type"]))
+            replaced_sources = [memory.get("source_ref")]
             for other in cursor.fetchall() or []:
                 if other["id"] != memory_id and _subject(memory["memory_type"], other["fact"]) == _subject(memory["memory_type"], fact):
-                    cursor.execute("UPDATE core_memories SET is_active = 0 WHERE id = %s AND user_id = %s", (other["id"], user_id))
-            cursor.execute("UPDATE core_memories SET fact = %s WHERE id = %s AND user_id = %s", (fact, memory_id, user_id))
+                    replaced_sources.append(other.get("source_ref"))
+                    cursor.execute(
+                        "UPDATE core_memories SET is_active = 0, forgotten_at = CURRENT_TIMESTAMP, "
+                        "forget_reason = 'superseded', superseded_by_id = %s "
+                        "WHERE id = %s AND user_id = %s",
+                        (memory_id, other["id"], user_id),
+                    )
+            cursor.execute(
+                "UPDATE core_memories SET fact = %s, confidence = 1.00, source_type = 'manual_edit', "
+                "source_ref = NULL, expires_at = NULL, last_confirmed_at = CURRENT_TIMESTAMP "
+                "WHERE id = %s AND user_id = %s",
+                (fact, memory_id, user_id),
+            )
+            _invalidate_history(cursor, user_id, replaced_sources, reason="manual_edit")
         else:
+            _invalidate_history(cursor, user_id, [memory.get("source_ref")], reason="user_requested")
             cursor.execute("DELETE FROM core_memories WHERE id = %s AND user_id = %s", (memory_id, user_id))
         if memory["memory_type"] == "user_name":
-            cursor.execute("UPDATE core_memories SET is_active = 0 WHERE user_id = %s AND memory_type = 'user_name' AND id <> %s", (user_id, memory_id))
+            if fact is not None:
+                cursor.execute(
+                    "UPDATE core_memories SET is_active = 0, forgotten_at = CURRENT_TIMESTAMP, "
+                    "forget_reason = 'superseded', superseded_by_id = %s "
+                    "WHERE user_id = %s AND memory_type = 'user_name' AND id <> %s AND is_active = 1",
+                    (memory_id, user_id, memory_id),
+                )
+            else:
+                cursor.execute(
+                    "UPDATE core_memories SET is_active = 0, forgotten_at = CURRENT_TIMESTAMP, "
+                    "forget_reason = 'user_requested', superseded_by_id = NULL "
+                    "WHERE user_id = %s AND memory_type = 'user_name' AND id <> %s AND is_active = 1",
+                    (user_id, memory_id),
+                )
             cursor.execute("UPDATE user_profiles SET username = %s WHERE user_id = %s", (fact.removeprefix("Tên người dùng là ") if fact else "Bạn", user_id))
             cursor.execute("UPDATE user_mood_timeline SET username = %s WHERE user_id = %s", (fact.removeprefix("Tên người dùng là ") if fact else "Bạn", user_id))
-        _invalidate_history(cursor, user_id)
         conn.commit()
         return True
     except ValueError:
@@ -467,3 +500,28 @@ def delete_memory(memory_id, user_id=DEFAULT_USER_ID):
 
 def update_memory(memory_id, fact, user_id=DEFAULT_USER_ID):
     return _mutate_memory(memory_id, user_id, fact)
+
+
+def list_memory_audit(user_id=DEFAULT_USER_ID, limit=100):
+    """Return active and forgotten personal memories for local inspection."""
+    conn = get_db_connection()
+    if not conn:
+        raise DatabaseUnavailable("Không thể đọc lịch sử bộ nhớ")
+    cursor = None
+    try:
+        _ensure_memory_tables(conn)
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT id, user_id, memory_type, fact, occurrence_count, is_active, confidence, importance, "
+            "source_type, source_ref, expires_at, last_confirmed_at, forgotten_at, forget_reason, "
+            "superseded_by_id, created_at FROM core_memories WHERE user_id = %s "
+            "ORDER BY id DESC LIMIT %s",
+            (user_id, max(1, min(int(limit), 500))),
+        )
+        return [dict(row) for row in (cursor.fetchall() or [])]
+    except Exception as exc:
+        raise DatabaseUnavailable("Không thể đọc lịch sử bộ nhớ") from exc
+    finally:
+        if cursor is not None:
+            cursor.close()
+        conn.close()

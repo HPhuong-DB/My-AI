@@ -11,28 +11,9 @@ from services.goal_service import get_goal, update_goal
 def _ensure_steps_table(conn) -> None:
     if not conn:
         return
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS goal_steps (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                goal_id INT NOT NULL,
-                user_id VARCHAR(100) NOT NULL DEFAULT 'default',
-                title VARCHAR(255) NOT NULL,
-                description TEXT,
-                position INT NOT NULL DEFAULT 1,
-                status VARCHAR(30) NOT NULL DEFAULT 'todo',
-                progress INT NOT NULL DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                INDEX idx_goal_steps_owner (goal_id, user_id)
-            )
-            """
-        )
-        conn.commit()
-    finally:
-        cursor.close()
+    from core.migrations import ensure_schema
+
+    ensure_schema(conn)
 
 
 def _normalize_steps(steps: list[dict[str, Any]]) -> list[dict[str, str]]:

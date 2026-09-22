@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -16,8 +17,7 @@ from agent.state_manager import StateManager
 from services.interaction_service import NaturalInteractionEngine
 from agent.presence import Presence
 from services import proactive_service as context
-from services.chat_service import get_recent_chat_history, save_chat_message
-from services.memory_service import get_recent_memories
+from services.memory_orchestrator import memory_orchestrator
 from services.session_service import user_lock
 from services.progress_service import evaluate_progress
 from services.tool_service import poll_due_reminder_notifications_for_all_users
@@ -28,8 +28,9 @@ logger = logging.getLogger("uvicorn.error")
 class ProactiveScheduler:
     """Periodically publish safe suggestions to the output event bus.
 
-    The scheduler only observes reminders/goals and emits UI events. It does
-    not call the LLM, mutate goals, complete reminders, or execute tools.
+    The scheduler observes reminders/goals, emits UI events and periodically
+    applies the bounded expired-memory policy. It does not call the LLM,
+    mutate goals, complete reminders, or execute tools.
     """
 
     _RISK_STATUSES = frozenset({"at_risk", "stalled", "overdue"})
@@ -82,6 +83,7 @@ class ProactiveScheduler:
         self.presence = presence or Presence()
         self._pending = {}
         self.last_reason: dict[str, str] = {}
+        self._last_memory_maintenance: float | None = None
 
     @property
     def running(self) -> bool:
@@ -178,8 +180,12 @@ class ProactiveScheduler:
                 return None
             if not is_reminder:
                 # Read evidence under the same lock used by chat and memory deletion.
-                history = await asyncio.to_thread(get_recent_chat_history, limit=8, user_id=user_id, strict=True)
-                memories = await asyncio.to_thread(get_recent_memories, limit=200, user_id=user_id, strict=True)
+                history, memories = await asyncio.to_thread(
+                    memory_orchestrator.recall_proactive_evidence,
+                    user_id,
+                    history_limit=8,
+                    memory_limit=200,
+                )
                 evaluation = await asyncio.to_thread(evaluate_progress, user_id)
                 topic = context.choose_topic(history, memories, evaluation.get('goals') or [])
                 if not topic:
@@ -218,14 +224,22 @@ class ProactiveScheduler:
                 self._pending.pop(event_id, None)
                 return False
             if event.type != EventType.PROACTIVE_REMINDER:
-                history = await asyncio.to_thread(get_recent_chat_history, limit=8, user_id=user_id, strict=True)
-                memories = await asyncio.to_thread(get_recent_memories, limit=200, user_id=user_id, strict=True)
+                history, memories = await asyncio.to_thread(
+                    memory_orchestrator.recall_proactive_evidence,
+                    user_id,
+                    history_limit=8,
+                    memory_limit=200,
+                )
                 evaluation = await asyncio.to_thread(evaluate_progress, user_id)
                 topic = context.choose_topic(history, memories, evaluation.get('goals') or [])
                 if not topic or topic['message'] != event.payload['message']:
                     self._pending.pop(event_id, None)
                     return False
-            await asyncio.to_thread(save_chat_message, 'assistant', event.payload['message'], user_id, strict=True)
+            await asyncio.to_thread(
+                memory_orchestrator.record_assistant_message,
+                user_id,
+                event.payload['message'],
+            )
             self._pending.pop(event_id, None)
             return True
 
@@ -285,6 +299,16 @@ class ProactiveScheduler:
     async def tick(self) -> list[Event]:
         """Run one scan; exposed for tests and a manual API check."""
         async with self._tick_lock:
+            sweep_seconds = max(0, int(os.getenv("MEMORY_FORGET_SWEEP_SECONDS", "3600")))
+            now = time.monotonic()
+            if sweep_seconds and (
+                self._last_memory_maintenance is None
+                or now - self._last_memory_maintenance >= sweep_seconds
+            ):
+                self._last_memory_maintenance = now
+                maintenance = await asyncio.to_thread(memory_orchestrator.maintain)
+                if maintenance.get("total"):
+                    logger.info("[memory] forgotten_expired=%s", maintenance["forgotten"])
             if self.state_manager.emergency_stopped:
                 return []
             self._pending = {key: value for key, value in self._pending.items() if time.monotonic() - value[2] <= 30}

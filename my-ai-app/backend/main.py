@@ -1,3 +1,6 @@
+import asyncio
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -5,6 +8,9 @@ from api import agent, chat, document, goals, image_chat, knowledge, memories, o
 from agent.runtime import agent_loop, output_bus, proactive_scheduler
 from services.health_service import check_health
 from core.database import DatabaseUnavailable
+from core.migrations import run_migrations
+
+logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="VTuber API")
 
@@ -16,6 +22,12 @@ async def database_error_handler(request, exc):
 
 @app.on_event("startup")
 async def startup_event():
+    migration_report = await asyncio.to_thread(run_migrations)
+    app.state.migration_report = migration_report
+    if not migration_report.get("ok"):
+        if migration_report.get("code") == "migration_failed":
+            raise RuntimeError(f"Database migration failed: {migration_report.get('reason')}")
+        logger.warning("[database] migration pending: %s", migration_report.get("reason"))
     agent_loop.start()
     proactive_scheduler.start()
 

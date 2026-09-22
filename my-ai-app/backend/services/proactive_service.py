@@ -5,6 +5,7 @@ import hashlib
 import re
 
 from core.database import DatabaseUnavailable, get_db_connection
+from core.migrations import ensure_schema
 from services.dialogue_context_service import normalize, tokens
 
 
@@ -17,18 +18,9 @@ def connection():
     conn = get_db_connection()
     if not conn:
         raise DatabaseUnavailable('Không đọc được tùy chọn chủ động')
+    ensure_schema(conn)
     cursor = conn.cursor(dictionary=True)
     try:
-        cursor.execute('''CREATE TABLE IF NOT EXISTS proactive_preferences (
-            user_id VARCHAR(100) PRIMARY KEY,
-            enabled BOOLEAN NOT NULL DEFAULT TRUE,
-            resume_on_message BOOLEAN NOT NULL DEFAULT FALSE,
-            quiet_until DATETIME(6) NULL,
-            awaiting_reply BOOLEAN NOT NULL DEFAULT FALSE,
-            last_topic VARCHAR(160) NULL,
-            last_sent_at DATETIME(6) NULL,
-            last_user_at DATETIME(6) NULL
-        )''')
         yield conn, cursor
     except Exception as exc:
         conn.rollback()

@@ -26,9 +26,18 @@ class ProactiveSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.record = self.enterContext(patch('agent.proactive_scheduler.context.record_outreach', side_effect=record))
         self.poll = self.enterContext(patch('agent.proactive_scheduler.poll_due_reminder_notifications_for_all_users', return_value=[]))
         self.progress = self.enterContext(patch('agent.proactive_scheduler.evaluate_progress', return_value={'goals': []}))
-        self.history = self.enterContext(patch('agent.proactive_scheduler.get_recent_chat_history', return_value=[{'role': 'user', 'content': 'Mình đang học Rust.'}]))
-        self.memories = self.enterContext(patch('agent.proactive_scheduler.get_recent_memories', return_value=[{'memory_type': 'goal', 'fact': 'Người dùng đang học Rust'}]))
-        self.save = self.enterContext(patch('agent.proactive_scheduler.save_chat_message'))
+        self.recall = self.enterContext(patch(
+            'agent.proactive_scheduler.memory_orchestrator.recall_proactive_evidence',
+            return_value=(
+                [{'role': 'user', 'content': 'Mình đang học Rust.'}],
+                [{'memory_type': 'goal', 'fact': 'Người dùng đang học Rust'}],
+            ),
+        ))
+        self.save = self.enterContext(patch('agent.proactive_scheduler.memory_orchestrator.record_assistant_message'))
+        self.maintain = self.enterContext(patch(
+            'agent.proactive_scheduler.memory_orchestrator.maintain',
+            return_value={'ok': True, 'forgotten': {}, 'total': 0},
+        ))
         prefs('default')
 
     async def test_context_offer_then_wait_for_user_instead_of_repeated_checkins(self):
@@ -38,8 +47,14 @@ class ProactiveSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.scheduler.tick(), [])
         self.save.assert_not_called()  # Not shown by a client yet.
         self.assertTrue(await self.scheduler.acknowledge('default', first[0].event_id))
-        self.save.assert_called_once_with('assistant', first[0].payload['message'], 'default', strict=True)
+        self.save.assert_called_once_with('default', first[0].payload['message'])
         self.assertFalse(await self.scheduler.acknowledge('default', first[0].event_id))
+
+    async def test_memory_maintenance_runs_once_per_sweep_window(self):
+        await self.scheduler.tick()
+        await self.scheduler.tick()
+
+        self.maintain.assert_called_once_with()
 
     async def test_absent_hidden_busy_reading_typing_and_night_are_silent(self):
         for update in [dict(visible=False), dict(busy=True), dict(reading=True), dict(typing=True), dict(local_hour=23)]:
@@ -49,7 +64,7 @@ class ProactiveSchedulerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await self.scheduler.tick(), [])
         self.scheduler.presence.remove('tab')
         self.assertEqual(await self.scheduler.tick(), [])
-        self.history.assert_not_called()
+        self.recall.assert_not_called()
 
     async def test_quiet_request_overrides_due_reminders_and_progress(self):
         self.rows['default']['enabled'] = False
@@ -58,7 +73,7 @@ class ProactiveSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.record.assert_not_called()
 
     async def test_no_relevant_or_deleted_memory_means_silence(self):
-        self.memories.return_value = []
+        self.recall.return_value = ([{'role': 'user', 'content': 'Mình đang học Rust.'}], [])
         self.assertEqual(await self.scheduler.tick(), [])
         self.assertEqual(self.scheduler.last_reason['default'], 'no_relevant_topic')
 
@@ -66,7 +81,7 @@ class ProactiveSchedulerTests(unittest.IsolatedAsyncioTestCase):
         for age in [10, 9 * 3600]:
             self.rows['default']['last_user_at'] = context.utcnow() - timedelta(seconds=age)
             self.assertEqual(await self.scheduler.tick(), [])
-        self.history.assert_not_called()
+        self.recall.assert_not_called()
 
     async def test_same_topic_is_not_repeated_after_a_short_answer(self):
         first = await self.scheduler.tick()
@@ -111,8 +126,7 @@ class ProactiveSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_context_and_memory_reads_are_strict_and_user_scoped(self):
         await self.scheduler.tick()
-        self.history.assert_called_once_with(limit=8, user_id='default', strict=True)
-        self.memories.assert_called_once_with(limit=200, user_id='default', strict=True)
+        self.recall.assert_called_once_with('default', history_limit=8, memory_limit=200)
 
     async def test_expired_offer_cannot_enter_history(self):
         event = (await self.scheduler.tick())[0]
@@ -130,6 +144,6 @@ class ProactiveSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_deleted_memory_after_offer_cannot_be_reintroduced_into_history(self):
         event = (await self.scheduler.tick())[0]
-        self.memories.return_value = []
+        self.recall.return_value = ([{'role': 'user', 'content': 'Mình đang học Rust.'}], [])
         self.assertFalse(await self.scheduler.acknowledge('default', event.event_id))
         self.save.assert_not_called()

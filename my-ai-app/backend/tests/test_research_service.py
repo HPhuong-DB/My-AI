@@ -19,7 +19,7 @@ class ResearchServiceTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(research_service, "search_web", new=AsyncMock(return_value={"ok": True, "results": [{"title": "Source", "url": "https://example.com", "snippet": "Short"}]})):
             with patch.object(research_service, "_read_source", new=AsyncMock(return_value={"title": "Source", "url": "https://example.com", "snippet": "Short", "content": "Long source", "ok": True})):
                 with patch.object(research_service, "summarize_research_sources", new=AsyncMock(return_value={"title": "Topic", "summary": "Summary", "key_points": ["Point"]})):
-                    with patch.object(research_service, "save_knowledge", return_value={"id": 1}) as save_mock:
+                    with patch("services.memory_orchestrator.memory_orchestrator.remember_knowledge", return_value={"id": 1}) as save_mock:
                         result = await research_service.run_research("Topic", "user-1")
 
         self.assertTrue(result["ok"])

@@ -1,6 +1,7 @@
 import unittest
 import asyncio
 import json
+from types import SimpleNamespace
 from time import perf_counter
 from unittest.mock import AsyncMock, patch
 
@@ -28,14 +29,12 @@ class LLMPerformanceTests(unittest.TestCase):
         self.assertIn("tool_calls", prompt)
 
     def test_fast_context_budget_keeps_deep_budget_available(self):
-        with patch.object(llm_service, "get_recent_chat_history", return_value=[]), \
-             patch.object(llm_service, "get_recent_memories", return_value=[]), \
-             patch.object(llm_service, "get_user_profile", return_value={}), \
-             patch.object(llm_service, "build_dialogue_context", return_value="") as build:
+        recalled = SimpleNamespace(prompt="", profile={})
+        with patch.object(llm_service.memory_orchestrator, "recall_prompt", return_value=recalled) as recall:
             llm_service._build_context_data("hello", "alice", "fast")
-            self.assertEqual(build.call_args.kwargs["max_chars"], llm_service.LLM_MAX_CONTEXT_CHARS_FAST)
+            self.assertEqual(recall.call_args.kwargs["max_chars"], llm_service.LLM_MAX_CONTEXT_CHARS_FAST)
             llm_service._build_context_data("hello", "alice", "deep")
-            self.assertEqual(build.call_args.kwargs["max_chars"], llm_service.LLM_MAX_CONTEXT_CHARS)
+            self.assertEqual(recall.call_args.kwargs["max_chars"], llm_service.LLM_MAX_CONTEXT_CHARS)
 
     def test_partial_json_reply_can_be_read_while_streaming(self):
         self.assertEqual(_reply_prefix('{"reply_vi":"Xin chào'), "Xin chào")

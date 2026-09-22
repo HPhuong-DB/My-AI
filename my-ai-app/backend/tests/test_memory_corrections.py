@@ -51,13 +51,36 @@ class MemoryCorrectionTests(unittest.TestCase):
         self.assertEqual(self.extract('Mai nói gọi mình là cậu, xưng tớ nhé.'), [])
 
     def test_correction_replaces_matching_subject_only(self):
-        cursor = FakeCursor(fetchall_result=[{"id": 1, "fact": "Người dùng thích trà"}, {"id": 2, "fact": "Người dùng thích cà phê"}])
+        cursor = FakeCursor(
+            fetchall_result=[{"id": 1, "fact": "Người dùng thích trà"}, {"id": 2, "fact": "Người dùng thích cà phê"}],
+            lastrowid=9,
+        )
         conn = FakeConnection(cursor)
         with patch.object(memory, "get_db_connection", return_value=conn), patch.object(memory, "_ensure_memory_tables"), patch("services.chat_service._ensure_table_exists"):
             self.assertTrue(memory.save_memory("preference", "Người dùng không còn thích trà", "alice", strict=True))
         updates = [params for sql, params in cursor.executed if sql.startswith("UPDATE core_memories")]
-        self.assertEqual(updates, [(1, "alice")])
+        self.assertEqual(updates, [(9, 1, "alice")])
+        self.assertTrue(any("forget_reason = 'superseded'" in sql for sql, _ in cursor.executed))
         self.assertTrue(any("cutoff_chat_id" in sql for sql, _ in cursor.executed))
+
+    def test_correction_with_provenance_excludes_only_source_turn(self):
+        cursor = FakeCursor(
+            fetchall_result=[{
+                "id": 1,
+                "fact": "Người dùng thích trà",
+                "source_ref": "user_message:0123456789abcdef",
+            }],
+            lastrowid=9,
+        )
+        conn = FakeConnection(cursor)
+        with patch.object(memory, "get_db_connection", return_value=conn), patch.object(memory, "_ensure_memory_tables"), patch("services.chat_service._ensure_table_exists"):
+            self.assertTrue(memory.save_memory("preference", "Người dùng không còn thích trà", "alice", strict=True))
+
+        sql = " ".join(statement for statement, _ in cursor.executed)
+        self.assertIn("memory_context_exclusions", sql)
+        self.assertNotIn("ON DUPLICATE KEY UPDATE cutoff_chat_id", sql)
+        exclusion_params = [params for statement, params in cursor.executed if "SHA2(TRIM(content)" in statement]
+        self.assertEqual(exclusion_params[0][-1], "0123456789abcdef")
 
     def test_missing_or_other_users_memory_cannot_be_edited(self):
         cursor = FakeCursor()

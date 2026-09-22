@@ -17,28 +17,9 @@ MAX_NOTE_TAGS = 20
 def _ensure_notes_table(conn) -> None:
     if not conn:
         return
+    from core.migrations import ensure_schema
 
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS personal_notes (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                user_id VARCHAR(100) NOT NULL DEFAULT 'default',
-                title VARCHAR(255) NOT NULL,
-                content TEXT NOT NULL,
-                tags TEXT,
-                is_archived TINYINT(1) DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                INDEX idx_personal_notes_user (user_id),
-                INDEX idx_personal_notes_archived (user_id, is_archived)
-            )
-            """
-        )
-        conn.commit()
-    finally:
-        cursor.close()
+    ensure_schema(conn)
 
 
 def _normalize_title(title: str) -> str:
